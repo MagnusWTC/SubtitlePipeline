@@ -1,10 +1,29 @@
 import { useCallback, useMemo, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 
-import { cancelTask, checkResumeFeasibility, getTasks, ResumeCheckResponse, retryTask, TaskListResponse } from '../api'
+import {
+  cancelTask,
+  checkResumeFeasibility,
+  getTasks,
+  ResumeCheckResponse,
+  retryTask,
+  Task,
+  TaskActionResponse,
+  TaskListResponse,
+} from '../api'
 import { usePolling } from '../hooks'
 
 const PAGE_SIZE = 20
+export const TASK_POLL_INTERVAL_MS = 3000
+export const TASK_CANCEL_POLL_INTERVAL_MS = 1000
+
+export function isCancellationInProgress(task: Task): boolean {
+  return task.status === 'processing' && Boolean(task.cancel_requested)
+}
+
+export function resolveTaskPollingInterval(tasks: Task[]): number {
+  return tasks.some(isCancellationInProgress) ? TASK_CANCEL_POLL_INTERVAL_MS : TASK_POLL_INTERVAL_MS
+}
 
 type TaskTab = 'all' | 'processing' | 'pending' | 'done' | 'failed'
 
@@ -32,6 +51,7 @@ function getVisiblePages(currentPage: number, totalPages: number): number[] {
 export function TasksPage() {
   const [data, setData] = useState<TaskListResponse>({ items: [], total: 0, page: 1, page_size: PAGE_SIZE, status_counts: {} })
   const [resumeChecks, setResumeChecks] = useState<Record<number, ResumeCheckResponse>>({})
+  const [cancellingTaskIds, setCancellingTaskIds] = useState<Set<number>>(() => new Set())
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [activeTab, setActiveTab] = useState<TaskTab>('all')
@@ -66,7 +86,8 @@ export function TasksPage() {
     }
   }, [activeTab, currentPage])
 
-  usePolling(load, 3000, [activeTab, currentPage])
+  const pollingInterval = resolveTaskPollingInterval(data.items)
+  usePolling(load, pollingInterval, [activeTab, currentPage])
 
   const totalPages = Math.max(1, Math.ceil(data.total / data.page_size))
   const visiblePages = useMemo(() => getVisiblePages(currentPage, totalPages), [currentPage, totalPages])
@@ -81,11 +102,9 @@ export function TasksPage() {
     setCurrentPage(1)
   }
 
-  const handleAction = async (taskId: number, type: 'cancel' | 'restart' | 'resume') => {
+  const handleAction = async (taskId: number, type: 'restart' | 'resume') => {
     try {
-      if (type === 'cancel') {
-        await cancelTask(taskId)
-      } else if (type === 'resume') {
+      if (type === 'resume') {
         await retryTask(taskId, 'resume')
       } else {
         await retryTask(taskId, 'restart')
@@ -93,6 +112,42 @@ export function TasksPage() {
       await load()
     } catch (err) {
       setError(err instanceof Error ? err.message : '任务操作失败')
+    }
+  }
+
+  const handleCancel = async (taskId: number) => {
+    setCancellingTaskIds((current) => {
+      const next = new Set(current)
+      next.add(taskId)
+      return next
+    })
+    setError('')
+
+    try {
+      const action: TaskActionResponse = await cancelTask(taskId)
+      setData((current) => ({
+        ...current,
+        items: current.items.map((task) =>
+          task.id === action.id
+            ? {
+                ...task,
+                status: action.status,
+                stage: action.stage,
+                progress: action.progress,
+                cancel_requested: action.cancel_requested,
+              }
+            : task,
+        ),
+      }))
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '未知错误'
+      setError(`取消任务失败：${message}`)
+    } finally {
+      setCancellingTaskIds((current) => {
+        const next = new Set(current)
+        next.delete(taskId)
+        return next
+      })
     }
   }
 
@@ -105,7 +160,7 @@ export function TasksPage() {
         </div>
         <button onClick={() => void load()}>立即刷新</button>
       </header>
-      {error ? <div className="alert error">{error}</div> : null}
+      {error ? <div className="alert error" role="alert">{error}</div> : null}
       <div className="card">
         <div className="task-toolbar">
           <div className="tab-row">
@@ -158,54 +213,58 @@ export function TasksPage() {
             </tr>
           </thead>
           <tbody>
-            {data.items.map((task) => (
-              <tr key={task.id} onClick={() => navigate(`/tasks/${task.id}`)}>
-                <td>{task.id}</td>
-                <td className="task-file">{task.file_path}</td>
-                <td>{task.status}</td>
-                <td>{task.stage}</td>
-                <td>{task.progress}%</td>
-                <td>{new Date(task.updated_at).toLocaleString()}</td>
-                <td className="actions-cell wrap">
-                  {['failed', 'cancelled', 'done'].includes(task.status) ? (
-                    <>
+            {data.items.map((task) => {
+              const isCancelling = cancellingTaskIds.has(task.id) || isCancellationInProgress(task)
+              return (
+                <tr key={task.id} onClick={() => navigate(`/tasks/${task.id}`)}>
+                  <td>{task.id}</td>
+                  <td className="task-file">{task.file_path}</td>
+                  <td>{isCancelling ? '取消中' : task.status}</td>
+                  <td>{task.stage}</td>
+                  <td>{task.progress}%</td>
+                  <td>{new Date(task.updated_at).toLocaleString()}</td>
+                  <td className="actions-cell wrap">
+                    {['failed', 'cancelled', 'done'].includes(task.status) ? (
+                      <>
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            void handleAction(task.id, 'restart')
+                          }}
+                        >
+                          重新执行
+                        </button>
+                        {task.status === 'failed' ? (
+                          <>
+                            <button
+                              disabled={!resumeChecks[task.id]?.can_resume}
+                              onClick={(event) => {
+                                event.stopPropagation()
+                                void handleAction(task.id, 'resume')
+                              }}
+                            >
+                              继续执行
+                            </button>
+                            {resumeChecks[task.id] && !resumeChecks[task.id].can_resume ? <span className="muted">中间文件缺失</span> : null}
+                          </>
+                        ) : null}
+                      </>
+                    ) : null}
+                    {['pending', 'processing'].includes(task.status) ? (
                       <button
+                        disabled={isCancelling}
                         onClick={(event) => {
                           event.stopPropagation()
-                          void handleAction(task.id, 'restart')
+                          void handleCancel(task.id)
                         }}
                       >
-                        重新执行
+                        {isCancelling ? '取消中' : '取消'}
                       </button>
-                      {task.status === 'failed' ? (
-                        <>
-                          <button
-                            disabled={!resumeChecks[task.id]?.can_resume}
-                            onClick={(event) => {
-                              event.stopPropagation()
-                              void handleAction(task.id, 'resume')
-                            }}
-                          >
-                            继续执行
-                          </button>
-                          {resumeChecks[task.id] && !resumeChecks[task.id].can_resume ? <span className="muted">中间文件缺失</span> : null}
-                        </>
-                      ) : null}
-                    </>
-                  ) : null}
-                  {task.status === 'processing' ? (
-                    <button
-                      onClick={(event) => {
-                        event.stopPropagation()
-                        void handleAction(task.id, 'cancel')
-                      }}
-                    >
-                      取消
-                    </button>
-                  ) : null}
-                </td>
-              </tr>
-            ))}
+                    ) : null}
+                  </td>
+                </tr>
+              )
+            })}
           </tbody>
         </table>
       </div>

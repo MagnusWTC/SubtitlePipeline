@@ -120,6 +120,14 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
         model_dir.mkdir(parents=True, exist_ok=True)
         (model_dir / "weights.bin").write_bytes(b"model")
 
+    def _successful_ffmpeg_process(self) -> MagicMock:
+        process = MagicMock()
+        process.pid = 1234
+        process.returncode = 0
+        process.communicate.return_value = ("", "")
+        process.poll.return_value = 0
+        return process
+
     def _fake_whisperx(self) -> types.SimpleNamespace:
         class FakeModel:
             def transcribe(self, audio_path: str):
@@ -519,8 +527,8 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
         scanner.scan_once()
 
         with patch.dict(sys.modules, {"whisperx": self._fake_whisperx()}, clear=False):
-            with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch("app.pipeline.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stderr="")
+            with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch("app.pipeline.subprocess.Popen") as mock_popen:
+                mock_popen.return_value = self._successful_ffmpeg_process()
                 worker = WorkerService(self.database)
                 self.assertTrue(worker.process_next_task())
 
@@ -545,8 +553,8 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
         self.assertEqual(scanner.scan_once().queued, 0)
         self.assertEqual(scanner.scan_once().queued, 1)
         with patch.dict(sys.modules, {"whisperx": self._fake_whisperx()}, clear=False):
-            with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch("app.pipeline.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stderr="")
+            with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch("app.pipeline.subprocess.Popen") as mock_popen:
+                mock_popen.return_value = self._successful_ffmpeg_process()
                 worker = WorkerService(self.database)
                 self.assertTrue(worker.process_next_task())
 
@@ -569,8 +577,8 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
         scanner.scan_once()
 
         with patch.dict(sys.modules, {"whisperx": self._fake_whisperx()}, clear=False):
-            with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch("app.pipeline.subprocess.run") as mock_run:
-                mock_run.return_value = MagicMock(returncode=0, stderr="")
+            with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch("app.pipeline.subprocess.Popen") as mock_popen:
+                mock_popen.return_value = self._successful_ffmpeg_process()
                 worker = WorkerService(self.database)
                 self.assertTrue(worker.process_next_task())
 
@@ -782,9 +790,35 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
         subtitle_path = self.output_dir / "timeout.zh-CN.srt"
         subtitle_path.write_text("1\n00:00:00,000 --> 00:00:01,000\nhello\n", encoding="utf-8")
 
+        class TimeoutProcess:
+            def __init__(self) -> None:
+                self.pid = 1234
+                self.returncode = None
+                self.terminated = False
+                self.killed = False
+
+            def communicate(self, timeout=None):
+                if not self.killed:
+                    raise subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=timeout)
+                self.returncode = -9
+                return "", ""
+
+            def terminate(self) -> None:
+                self.terminated = True
+
+            def kill(self) -> None:
+                self.killed = True
+
+            def poll(self):
+                return self.returncode
+
+        processes = [TimeoutProcess(), TimeoutProcess()]
         with patch("app.pipeline.shutil.which", return_value="ffmpeg"), patch(
-            "app.pipeline.subprocess.run",
-            side_effect=subprocess.TimeoutExpired(cmd=["ffmpeg"], timeout=7200),
+            "app.pipeline.subprocess.Popen",
+            side_effect=processes,
+        ), patch(
+            "app.pipeline.time.monotonic",
+            side_effect=[0.0, 7201.0, 0.0, 7201.0],
         ):
             with self.assertRaises(PipelineError) as extract_error:
                 extract_audio(context)

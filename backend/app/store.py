@@ -12,6 +12,7 @@ from typing import Any, Iterator
 logger = logging.getLogger(__name__)
 
 from .defaults import RESULT_AFFECTING_GROUPS, SYSTEM_LEVEL_FIELDS, copy_default_config, detect_device
+from .llm import sanitize_diagnostic_data
 from .pipeline import (
     check_resume_feasibility,
     cleanup_intermediates,
@@ -182,6 +183,19 @@ class Database:
                     FOREIGN KEY(task_id) REFERENCES tasks(id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_task_logs_task_time ON task_logs(task_id, timestamp, id);
+
+                CREATE TABLE IF NOT EXISTS worker_runtime (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    pid INTEGER NOT NULL,
+                    process_start_id TEXT NOT NULL,
+                    command_line TEXT NOT NULL,
+                    process_group_id INTEGER,
+                    heartbeat_at TEXT NOT NULL,
+                    registered_at TEXT NOT NULL,
+                    current_task_id INTEGER,
+                    current_stage TEXT,
+                    updated_at TEXT NOT NULL
+                );
 
                 CREATE TABLE IF NOT EXISTS system_config (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -362,24 +376,148 @@ class Database:
         return self.get_config()
 
     def recover_orphaned_tasks(self) -> int:
-        """Reset tasks stuck in 'processing' (e.g. after a crash) to 'failed' so users can retry."""
+        """Resolve tasks left in processing after a Worker exits.
+
+        Cancellation is authoritative: tasks whose Worker was terminated by a
+        forced cancellation become cancelled before other orphaned tasks are
+        failed as interrupted.
+        """
         now = utc_now()
         with self.connect() as connection:
-            cursor = connection.execute(
+            connection.execute("BEGIN IMMEDIATE")
+            cancelled_rows = connection.execute(
+                """
+                SELECT id, stage
+                FROM tasks
+                WHERE status = 'processing' AND cancel_requested = 1
+                """
+            ).fetchall()
+            cancelled_count = connection.execute(
+                """
+                UPDATE tasks
+                SET status = 'cancelled',
+                    error_message = 'Worker 已终止，任务取消',
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE status = 'processing' AND cancel_requested = 1
+                """,
+                (now, now),
+            ).rowcount
+            failed_rows = connection.execute(
+                """
+                SELECT id, stage
+                FROM tasks
+                WHERE status = 'processing' AND cancel_requested = 0
+                """
+            ).fetchall()
+            failed_count = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'failed',
                     error_message = '系统重启，任务中断',
                     updated_at = ?,
                     finished_at = ?
-                WHERE status = 'processing'
+                WHERE status = 'processing' AND cancel_requested = 0
                 """,
                 (now, now),
+            ).rowcount
+        for row in cancelled_rows:
+            self.log(
+                row["id"],
+                normalize_stage_name(str(row["stage"])),
+                "WARNING",
+                "Worker 已终止，任务取消",
             )
-            count = cursor.rowcount
-        if count:
-            logger.warning("系统启动: 已将 %d 个中断的 processing 任务标记为 failed", count)
-        return count
+        for row in failed_rows:
+            self.log(
+                row["id"],
+                normalize_stage_name(str(row["stage"])),
+                "ERROR",
+                "系统重启，任务中断",
+            )
+        if cancelled_count:
+            logger.warning("系统启动: 已将 %d 个取消中的 processing 任务标记为 cancelled", cancelled_count)
+        if failed_count:
+            logger.warning("系统启动: 已将 %d 个中断的 processing 任务标记为 failed", failed_count)
+        return int(cancelled_count + failed_count)
+
+    def register_worker(
+        self,
+        pid: int,
+        process_start_id: str,
+        command_line: str,
+        process_group_id: int | None = None,
+    ) -> dict[str, Any]:
+        now = utc_now()
+        with self.connect() as connection:
+            connection.execute(
+                """
+                INSERT INTO worker_runtime (
+                    id, pid, process_start_id, command_line, process_group_id,
+                    heartbeat_at, registered_at, current_task_id, current_stage, updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?, NULL, NULL, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                    pid = excluded.pid,
+                    process_start_id = excluded.process_start_id,
+                    command_line = excluded.command_line,
+                    process_group_id = excluded.process_group_id,
+                    heartbeat_at = excluded.heartbeat_at,
+                    registered_at = excluded.registered_at,
+                    current_task_id = NULL,
+                    current_stage = NULL,
+                    updated_at = excluded.updated_at
+                """,
+                (pid, process_start_id, command_line, process_group_id, now, now, now),
+            )
+        worker = self.get_worker_runtime()
+        if worker is None:
+            raise RuntimeError("failed to register worker")
+        return worker
+
+    def get_worker_runtime(self) -> dict[str, Any] | None:
+        with self.connect() as connection:
+            row = connection.execute(
+                """
+                SELECT id, pid, process_start_id, command_line, process_group_id,
+                       heartbeat_at, registered_at, current_task_id, current_stage, updated_at
+                FROM worker_runtime
+                WHERE id = 1
+                """
+            ).fetchone()
+        return dict(row) if row else None
+
+    def heartbeat_worker(self, pid: int, process_start_id: str) -> bool:
+        now = utc_now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE worker_runtime
+                SET heartbeat_at = ?, updated_at = ?
+                WHERE id = 1 AND pid = ? AND process_start_id = ?
+                """,
+                (now, now, pid, process_start_id),
+            )
+        return cursor.rowcount > 0
+
+    def update_worker_task(
+        self,
+        pid: int,
+        process_start_id: str,
+        task_id: int | None,
+        stage: str | None,
+    ) -> bool:
+        now = utc_now()
+        with self.connect() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE worker_runtime
+                SET current_task_id = ?, current_stage = ?, updated_at = ?
+                WHERE id = 1 AND pid = ? AND process_start_id = ?
+                """,
+                (task_id, stage, now, pid, process_start_id),
+            )
+        return cursor.rowcount > 0
 
     def clear_restart_required(self) -> None:
         with self.connect() as connection:
@@ -542,32 +680,81 @@ class Database:
         items = []
         for row in rows:
             item = dict(row)
-            item["details"] = json.loads(item["details_json"]) if item["details_json"] else None
+            raw_details = json.loads(item["details_json"]) if item["details_json"] else None
+            item["details"] = sanitize_diagnostic_data(raw_details) if raw_details else None
+            safe_message = sanitize_diagnostic_data(str(item["message"]))
+            item["message"] = safe_message if isinstance(safe_message, str) else str(safe_message)
             item.pop("details_json", None)
             items.append(item)
         return PageResult(items, page, page_size, total, {})
 
     def log(self, task_id: int, stage: str, level: str, message: str, details: dict[str, Any] | None = None) -> None:
+        safe_message = sanitize_diagnostic_data(str(message))
+        if not isinstance(safe_message, str):
+            safe_message = str(safe_message)
+        safe_details = sanitize_diagnostic_data(details) if details else None
+        if not isinstance(safe_details, dict):
+            safe_details = None
         with self.connect() as connection:
             connection.execute(
                 """
                 INSERT INTO task_logs (task_id, stage, level, message, details_json, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
                 """,
-                (task_id, stage, level, message, json.dumps(details) if details else None, utc_now()),
+                (
+                    task_id,
+                    stage,
+                    level,
+                    safe_message,
+                    json.dumps(safe_details) if safe_details else None,
+                    utc_now(),
+                ),
             )
 
     def request_cancel(self, task_id: int) -> dict[str, Any] | None:
+        task, _ = self.request_cancel_with_result(task_id)
+        return task
+
+    def request_cancel_with_result(self, task_id: int) -> tuple[dict[str, Any] | None, bool]:
+        """Request cancellation and report whether this call changed state."""
+        now = utc_now()
+        cancelled_pending = False
+        cancel_requested = False
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE tasks
-                SET cancel_requested = 1, updated_at = ?
-                WHERE id = ? AND status = 'processing'
+                SET status = 'cancelled',
+                    cancel_requested = 1,
+                    error_message = '任务已取消',
+                    updated_at = ?,
+                    finished_at = ?
+                WHERE id = ? AND status = 'pending'
                 """,
-                (utc_now(), task_id),
+                (now, now, task_id),
             )
-        return self.get_task(task_id)
+            cancelled_pending = cursor.rowcount > 0
+            if not cancelled_pending:
+                cursor = connection.execute(
+                    """
+                    UPDATE tasks
+                    SET cancel_requested = 1, updated_at = ?
+                    WHERE id = ? AND status = 'processing' AND cancel_requested = 0
+                    """,
+                    (now, task_id),
+                )
+                cancel_requested = cursor.rowcount > 0
+        task = self.get_task(task_id)
+        if cancelled_pending:
+            self.log(task_id, str(task["stage"]) if task else "cancel", "WARNING", "待处理任务已取消")
+        elif cancel_requested:
+            self.log(
+                task_id,
+                str(task["stage"]) if task else "cancel",
+                "INFO",
+                "已请求取消任务，等待当前阶段安全停止",
+            )
+        return task, bool(cancelled_pending or cancel_requested)
 
     def request_retry(self, task_id: int, mode: str = "restart") -> dict[str, Any] | None:
         if mode not in {"restart", "resume"}:
@@ -731,7 +918,7 @@ class Database:
             if not row:
                 return None
             start_stage = "extract_audio" if row["stage"] == "queued" else normalize_stage_name(str(row["stage"]))
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'processing',
@@ -740,7 +927,7 @@ class Database:
                     config_snapshot = ?,
                     updated_at = ?,
                     started_at = COALESCE(started_at, ?)
-                WHERE id = ?
+                WHERE id = ? AND status = 'pending' AND cancel_requested = 0
                 """,
                 (
                     start_stage,
@@ -751,6 +938,8 @@ class Database:
                     row["id"],
                 ),
             )
+            if cursor.rowcount == 0:
+                return None
             task_id = row["id"]
         self.log(task_id, "processing", "INFO", "任务开始处理", {"config_snapshot": snapshot})
         task = self.get_task(task_id)
@@ -759,6 +948,7 @@ class Database:
         return task
 
     def update_task_stage(self, task_id: int, stage: str, progress: float, status: str = "processing") -> None:
+        now = utc_now()
         with self.connect() as connection:
             connection.execute(
                 """
@@ -766,7 +956,15 @@ class Database:
                 SET stage = ?, progress = ?, status = ?, updated_at = ?
                 WHERE id = ?
                 """,
-                (stage, progress, status, utc_now(), task_id),
+                (stage, progress, status, now, task_id),
+            )
+            connection.execute(
+                """
+                UPDATE worker_runtime
+                SET current_stage = ?, updated_at = ?
+                WHERE current_task_id = ?
+                """,
+                (stage, now, task_id),
             )
 
     def mark_task_done(self, task_id: int, result_payload: dict[str, Any]) -> None:
@@ -774,7 +972,7 @@ class Database:
         final_stage = "mux" if task and task["config_snapshot"] and task["config_snapshot"]["mux"]["enabled"] else "output_finalize"
         now = utc_now()
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'done',
@@ -784,46 +982,66 @@ class Database:
                     error_message = NULL,
                     updated_at = ?,
                     finished_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status = 'processing' AND cancel_requested = 0
                 """,
                 (final_stage, json.dumps(result_payload), now, now, task_id),
             )
-        self.log(task_id, final_stage, "INFO", "任务处理完成", result_payload)
+        if cursor.rowcount > 0:
+            self.log(task_id, final_stage, "INFO", "任务处理完成", result_payload)
+            return
+        latest = self.get_task(task_id)
+        if latest and latest["status"] == "processing" and bool(latest["cancel_requested"]):
+            self.mark_task_cancelled(task_id, str(latest["stage"]))
 
     def mark_task_cancelled(self, task_id: int, stage: str, message: str = "任务已取消") -> None:
         now = utc_now()
         with self.connect() as connection:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 UPDATE tasks
                 SET status = 'cancelled',
+                    cancel_requested = 1,
                     stage = ?,
                     progress = progress,
                     error_message = ?,
                     updated_at = ?,
                     finished_at = ?
-                WHERE id = ?
+                WHERE id = ? AND status IN ('pending', 'processing')
                 """,
                 (stage, message, now, now, task_id),
             )
-        self.log(task_id, stage, "WARNING", message)
+        if cursor.rowcount > 0:
+            self.log(task_id, stage, "WARNING", message)
 
-    def mark_task_failure(self, task_id: int, stage: str, message: str) -> dict[str, Any]:
+    def mark_task_failure(
+        self,
+        task_id: int,
+        stage: str,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         task = self.get_task(task_id)
         if task is None:
             raise RuntimeError("task not found during failure")
+        if bool(task["cancel_requested"]):
+            self.mark_task_cancelled(task_id, stage)
+            cancelled = self.get_task(task_id)
+            if cancelled is None:
+                raise RuntimeError("failed to reload cancelled task")
+            return cancelled
         retry_count = int(task["retry_count"])
         max_retries = int(task["max_retries"])
         should_retry = retry_count < max_retries
         retry_mode = "restart"
-        details: dict[str, Any] = {"will_retry": should_retry}
+        failure_details: dict[str, Any] = dict(details or {})
+        failure_details["will_retry"] = should_retry
         if should_retry and task["config_snapshot"]:
             retry_mode = str(task["config_snapshot"]["processing"].get("retry_mode", "restart"))
             if retry_mode == "resume":
                 feasibility = check_resume_feasibility(task)
                 if not feasibility["can_resume"]:
                     retry_mode = "restart"
-                    details["resume_missing"] = feasibility["missing"]
+                    failure_details["resume_missing"] = feasibility["missing"]
                 else:
                     stage = str(feasibility.get("resume_stage", normalize_stage_name(stage)))
         if should_retry and retry_mode == "restart":
@@ -832,7 +1050,7 @@ class Database:
         now = utc_now()
         with self.connect() as connection:
             if should_retry:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE tasks
                     SET status = 'pending',
@@ -841,7 +1059,7 @@ class Database:
                         retry_count = retry_count + 1,
                         error_message = ?,
                         updated_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'processing' AND cancel_requested = 0
                     """,
                     (
                         "queued" if retry_mode == "restart" else stage,
@@ -852,7 +1070,7 @@ class Database:
                     ),
                 )
             else:
-                connection.execute(
+                cursor = connection.execute(
                     """
                     UPDATE tasks
                     SET status = 'failed',
@@ -860,13 +1078,21 @@ class Database:
                         error_message = ?,
                         updated_at = ?,
                         finished_at = ?
-                    WHERE id = ?
+                    WHERE id = ? AND status = 'processing' AND cancel_requested = 0
                     """,
                     (stage, message, now, now, task_id),
                 )
+        if cursor.rowcount == 0:
+            latest = self.get_task(task_id)
+            if latest and latest["status"] == "processing" and bool(latest["cancel_requested"]):
+                self.mark_task_cancelled(task_id, str(latest["stage"]))
+                latest = self.get_task(task_id)
+            if latest is None:
+                raise RuntimeError("failed to reload task after concurrent state change")
+            return latest
         level = "WARNING" if should_retry else "ERROR"
-        details["retry_mode"] = retry_mode
-        self.log(task_id, stage, level, message, details)
+        failure_details["retry_mode"] = retry_mode
+        self.log(task_id, stage, level, message, failure_details)
         updated = self.get_task(task_id)
         if updated is None:
             raise RuntimeError("failed to reload task after failure")

@@ -5,12 +5,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Response, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from .llm import sanitize_diagnostic_data
 from .logging_utils import setup_logging
 from .model_manager import (
     DEFAULT_PROVIDER,
@@ -23,6 +24,7 @@ from .model_manager import (
 from .pipeline import PipelineError, check_resume_feasibility, get_translation_provider
 from .runtime import ScannerService, WorkerService
 from .store import Database
+from .worker_control import FORCED_CANCEL_STAGES, request_forced_worker_shutdown
 
 
 class ConfigUpdateRequest(BaseModel):
@@ -45,6 +47,8 @@ class TaskActionResponse(BaseModel):
     stage: str
     progress: float
     cancel_requested: bool
+    outcome: str
+    message: str
 
 
 class ScanResponse(BaseModel):
@@ -179,20 +183,50 @@ def create_app() -> FastAPI:
         task = database.get_task(task_id)
         if not task:
             raise HTTPException(status_code=404, detail="task not found")
-        return task
+        sanitized = sanitize_diagnostic_data(task)
+        return sanitized if isinstance(sanitized, dict) else task
 
     @app.post("/api/tasks/{task_id}/cancel", response_model=TaskActionResponse)
-    def cancel_task(task_id: int) -> TaskActionResponse:
+    def cancel_task(task_id: int, response: Response) -> TaskActionResponse:
         database = get_database(app)
-        task = database.request_cancel(task_id)
+        task, newly_requested = database.request_cancel_with_result(task_id)
         if not task:
-            raise HTTPException(status_code=404, detail="task not found or not processing")
+            raise HTTPException(status_code=404, detail="task not found")
+        if task["status"] in {"done", "failed"}:
+            outcome = "not_cancellable"
+            message = "任务已完成，无法取消" if task["status"] == "done" else "任务已失败，无法取消"
+            response.status_code = status.HTTP_409_CONFLICT
+        elif task["status"] == "cancelled":
+            outcome = "cancelled"
+            message = "任务已取消"
+        elif task["status"] == "processing" and bool(task["cancel_requested"]):
+            outcome = "cancelling"
+            message = "取消请求已接受，等待当前阶段安全停止"
+            response.status_code = status.HTTP_202_ACCEPTED
+            if newly_requested and str(task["stage"]) in FORCED_CANCEL_STAGES:
+                shutdown = request_forced_worker_shutdown(database, task_id)
+                database.log(
+                    task_id,
+                    str(task["stage"]),
+                    "WARNING" if shutdown.requested else "INFO",
+                    "已请求强制终止 Worker" if shutdown.requested else "未找到可安全终止的 Worker，回退协作取消",
+                    {
+                        "requested": shutdown.requested,
+                        "reason": shutdown.reason,
+                        "pid": shutdown.pid,
+                    },
+                )
+        else:
+            outcome = "not_cancellable"
+            message = "当前任务状态不能取消"
         return TaskActionResponse(
             id=task["id"],
             status=task["status"],
             stage=task["stage"],
             progress=task["progress"],
             cancel_requested=bool(task["cancel_requested"]),
+            outcome=outcome,
+            message=message,
         )
 
     @app.post("/api/tasks/{task_id}/retry", response_model=TaskActionResponse)
@@ -210,6 +244,8 @@ def create_app() -> FastAPI:
             stage=task["stage"],
             progress=task["progress"],
             cancel_requested=bool(task["cancel_requested"]),
+            outcome="retried",
+            message="任务已重新进入队列",
         )
 
     @app.get("/api/tasks/{task_id}/resume-check")

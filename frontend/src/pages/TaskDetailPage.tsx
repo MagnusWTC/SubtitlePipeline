@@ -1,8 +1,59 @@
 import { useCallback, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
-import { getTask, getTaskLogs, LogResponse, Task } from '../api'
+import { getTask, getTaskLogs, LogItem, LogResponse, Task } from '../api'
 import { usePolling } from '../hooks'
+
+const PRIMARY_DETAIL_KEYS = ['error_code', 'http_status', 'finish_reason'] as const
+
+type PrimaryDetailKey = (typeof PRIMARY_DETAIL_KEYS)[number]
+
+function hasLogDetails(log: LogItem): boolean {
+  return Boolean(log.details && Object.keys(log.details).length > 0)
+}
+
+function formatDetailValue(value: unknown): string {
+  if (typeof value === 'string') {
+    return value
+  }
+  if (value === null || value === undefined) {
+    return '-'
+  }
+  return JSON.stringify(value)
+}
+
+function primaryDetailEntries(details: Record<string, unknown>): Array<[PrimaryDetailKey, unknown]> {
+  return PRIMARY_DETAIL_KEYS.flatMap((key) => {
+    const value = key === 'http_status' ? details.http_status ?? details.status_code : details[key]
+    return value === undefined ? [] : [[key, value] as [PrimaryDetailKey, unknown]]
+  })
+}
+
+function LogDetails({ log }: { log: LogItem }) {
+  if (!hasLogDetails(log) || !log.details) {
+    return <span className="muted log-detail-empty">无详情</span>
+  }
+
+  const entries = primaryDetailEntries(log.details)
+  return (
+    <details className="log-details">
+      <summary>查看详情</summary>
+      <div className="log-details-body">
+        {entries.length ? (
+          <dl className="log-detail-grid">
+            {entries.map(([key, value]) => (
+              <div key={key}>
+                <dt>{key}</dt>
+                <dd>{formatDetailValue(value)}</dd>
+              </div>
+            ))}
+          </dl>
+        ) : null}
+        <pre data-testid={'log-details-json-' + log.id}>{JSON.stringify(log.details, null, 2)}</pre>
+      </div>
+    </details>
+  )
+}
 
 export function TaskDetailPage() {
   const { taskId } = useParams()
@@ -49,6 +100,8 @@ export function TaskDetailPage() {
     return <div className="alert error">缺少任务 ID</div>
   }
 
+  const isCancelling = task?.status === 'processing' && Boolean(task.cancel_requested)
+
   return (
     <section>
       <header className="page-header">
@@ -59,6 +112,7 @@ export function TaskDetailPage() {
         <Link to="/">返回列表</Link>
       </header>
       {error ? <div className="alert error">{error}</div> : null}
+      {isCancelling ? <div className="alert warning" role="status">取消请求已提交，正在等待当前处理步骤安全停止。</div> : null}
       {task ? (
         <>
           <div className="detail-grid">
@@ -71,7 +125,7 @@ export function TaskDetailPage() {
                 </div>
                 <div>
                   <dt>状态</dt>
-                  <dd>{task.status}</dd>
+                  <dd>{isCancelling ? '取消中' : task.status}</dd>
                 </div>
                 <div>
                   <dt>阶段</dt>
@@ -123,7 +177,10 @@ export function TaskDetailPage() {
                   <span>{new Date(log.timestamp).toLocaleString()}</span>
                   <strong>{log.level}</strong>
                   <span>{log.stage}</span>
-                  <span>{log.message}</span>
+                  <div className="log-message">
+                    <span>{log.message}</span>
+                    <LogDetails log={log} />
+                  </div>
                 </li>
               ))}
             </ul>

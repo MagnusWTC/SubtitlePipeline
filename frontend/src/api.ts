@@ -20,6 +20,16 @@ export type Task = {
   finished_at?: string | null
 }
 
+export type TaskActionResponse = {
+  id: number
+  status: string
+  stage: string
+  progress: number
+  cancel_requested: boolean
+  outcome: 'cancelled' | 'cancelling' | 'not_cancellable' | 'retried'
+  message: string
+}
+
 export type TaskListResponse = {
   items: Task[]
   total: number
@@ -33,6 +43,7 @@ export type LogItem = {
   stage: string
   level: string
   message: string
+  details: Record<string, unknown> | null
   timestamp: string
 }
 
@@ -402,8 +413,8 @@ export function retryTask(taskId: number, mode: RetryMode): Promise<void> {
   })
 }
 
-export function cancelTask(taskId: number): Promise<void> {
-  return request<void>(`/api/tasks/${taskId}/cancel`, { method: 'POST' })
+export function cancelTask(taskId: number): Promise<TaskActionResponse> {
+  return request<TaskActionResponse>(`/api/tasks/${taskId}/cancel`, { method: 'POST' })
 }
 
 export function getConfig(): Promise<AppConfig> {

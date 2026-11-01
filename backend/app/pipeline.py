@@ -11,7 +11,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app.segment_cleaner import clean_segments
 
@@ -22,6 +22,9 @@ CONTEXT_SIZE = 5
 MAX_CHUNK_WORKERS = 1
 MAX_CHUNK_RETRIES = 5
 MAX_PARTIAL_RETRIES = 3
+FFMPEG_TIMEOUT_SECONDS = 7200
+FFMPEG_POLL_INTERVAL_SECONDS = 0.25
+FFMPEG_TERMINATE_TIMEOUT_SECONDS = 5.0
 
 TRANSLATION_PRESETS = {
     "general": "You are a professional subtitle translator. Keep the translation natural, accurate, concise, and easy to read on screen.",
@@ -45,15 +48,70 @@ FORMAT_INSTRUCTION = (
 
 
 class PipelineError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        details: dict[str, Any] | None = None,
+        *,
+        error_code: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.error_code = error_code
+        self.details = details or {}
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "error_code": self.error_code,
+            "message": str(self),
+            "details": self.details,
+        }
 
 
 class TranslationRateLimitError(PipelineError):
-    pass
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message, details, error_code="LLM_RATE_LIMIT")
 
 
 class CancellationRequested(RuntimeError):
-    pass
+    def __init__(self, stage: str = "unknown") -> None:
+        self.stage = stage
+        super().__init__(f"任务已在阶段 {stage} 取消")
+
+
+@dataclass(frozen=True)
+class CancellationToken:
+    """Read-only cancellation probe shared by long-running pipeline stages."""
+
+    probe: Callable[[], bool]
+
+    @classmethod
+    def never(cls) -> "CancellationToken":
+        return cls(lambda: False)
+
+    def is_cancelled(self) -> bool:
+        try:
+            return bool(self.probe())
+        except Exception:
+            logger.exception("取消状态检查失败")
+            return False
+
+    def raise_if_cancelled(self, stage: str) -> None:
+        if self.is_cancelled():
+            raise CancellationRequested(stage)
+
+    def wait(self, seconds: float, stage: str, interval: float = 0.1) -> None:
+        deadline = time.monotonic() + max(seconds, 0)
+        while True:
+            self.raise_if_cancelled(stage)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(interval, remaining))
+
+
+def _raise_if_cancelled(cancel_token: CancellationToken | None, stage: str) -> None:
+    if cancel_token is not None:
+        cancel_token.raise_if_cancelled(stage)
 
 
 @dataclass
@@ -78,8 +136,49 @@ from .asr import (
 )
 from .asr.aligners import QwenForcedAligner, WhisperXAligner
 from .asr.helpers import get_models_root
-from .llm import LLMError, LLMMessage, LLMRateLimitError, create_llm_client
+from .llm import (
+    LLM_RATE_LIMIT,
+    LLM_UNKNOWN_ERROR,
+    LLMError,
+    LLMMessage,
+    LLMRateLimitError,
+    create_llm_client,
+    sanitize_diagnostic_data,
+)
 from .model_manager import DEFAULT_PROVIDER, infer_provider_from_model_name, normalize_provider_name
+
+
+def _pipeline_error_from(exc: Exception, message: str | None = None) -> PipelineError:
+    error_message = message or str(exc)
+    details = getattr(exc, "details", None)
+    error_code = getattr(exc, "error_code", None)
+    if isinstance(exc, TranslationRateLimitError):
+        return TranslationRateLimitError(error_message, details)
+    return PipelineError(error_message, details, error_code=error_code)
+
+
+def _diagnostic_log_payload(exc: Exception) -> dict[str, Any]:
+    return sanitize_diagnostic_data(
+        {
+            "error_code": getattr(exc, "error_code", None),
+            "message": str(exc),
+            "details": getattr(exc, "details", None) or {},
+        }
+    )
+
+
+def _log_exception_safely(message: str, exc: Exception) -> None:
+    """Log with logger.exception without exposing an upstream exception chain."""
+    safe_error = PipelineError(
+        str(sanitize_diagnostic_data(str(exc))),
+        sanitize_diagnostic_data(getattr(exc, "details", None) or {}),
+        error_code=getattr(exc, "error_code", None),
+    )
+    try:
+        raise safe_error from None
+    except PipelineError:
+        logger.exception(message)
+
 
 STAGE_ALIAS_MAP = {
     "asr": "run_asr",
@@ -336,15 +435,16 @@ class ChunkedTranslator:
         content_type: str,
         custom_prompt: str,
         on_chunk_complete=None,
+        cancel_token: CancellationToken | None = None,
     ):
         self.provider = provider
         self.content_type = content_type
         self.custom_prompt = custom_prompt
         self.on_chunk_complete = on_chunk_complete
-        self.pause_event = threading.Event()
-        self.pause_event.set()
+        self.cancel_token = cancel_token
 
     def translate_language(self, segments: list[dict[str, Any]], target_language: str) -> list[str]:
+        _raise_if_cancelled(self.cancel_token, "translate")
         chunks = build_chunks(segments, CHUNK_SIZE, CONTEXT_SIZE)
         if not chunks:
             return []
@@ -353,6 +453,7 @@ class ChunkedTranslator:
         attempts = {chunk.start_index: 0 for chunk in chunks}
         max_workers = MAX_CHUNK_WORKERS
         while pending:
+            _raise_if_cancelled(self.cancel_token, "translate")
             current_batch = pending[:max_workers]
             pending = pending[max_workers:]
             rate_limited: list[TranslationChunk] = []
@@ -366,35 +467,51 @@ class ChunkedTranslator:
                     chunk = futures[future]
                     try:
                         translated_lines = future.result()
+                    except CancellationRequested:
+                        raise
                     except TranslationRateLimitError as exc:
                         attempts[chunk.start_index] += 1
                         if attempts[chunk.start_index] > MAX_CHUNK_RETRIES:
-                            raise PipelineError(f"分块翻译多次触发限流: {exc}") from exc
+                            raise _pipeline_error_from(exc, f"分块翻译多次触发限流: {exc}") from exc
                         rate_limited.append(chunk)
                         max_wait = max(max_wait, 2 ** (attempts[chunk.start_index] - 1))
                     except Exception as exc:
-                        raise PipelineError(str(exc)) from exc
+                        raise _pipeline_error_from(exc) from exc
                     else:
                         for position, line in enumerate(chunk.main_segments):
                             merged[line.index] = translated_lines[position]
                         if self.on_chunk_complete is not None:
                             self.on_chunk_complete()
             if rate_limited:
-                self.pause_event.clear()
-                time.sleep(max_wait)
-                self.pause_event.set()
+                self._wait_for_rate_limit_backoff(max_wait)
                 if max_workers > 1:
                     max_workers -= 1
                 pending = rate_limited + pending
+        _raise_if_cancelled(self.cancel_token, "translate")
         if any(item is None for item in merged):
             raise PipelineError("分块翻译结果不完整")
         return [item or "" for item in merged]
 
+    def _wait_for_rate_limit_backoff(self, seconds: float) -> None:
+        if self.cancel_token is not None:
+            self.cancel_token.wait(seconds, "translate")
+            return
+        time.sleep(max(seconds, 0.0))
+
     def _translate_chunk(self, chunk: TranslationChunk, target_language: str) -> list[str]:
-        self.pause_event.wait()
+        _raise_if_cancelled(self.cancel_token, "translate")
         if isinstance(self.provider, LLMTranslationProvider):
-            return self.provider.translate_chunk(chunk, target_language, self.content_type, self.custom_prompt)
-        return self.provider.translate_batch([line.text for line in chunk.main_segments], target_language)
+            result = self.provider.translate_chunk(
+                chunk,
+                target_language,
+                self.content_type,
+                self.custom_prompt,
+                self.cancel_token,
+            )
+        else:
+            result = self.provider.translate_batch([line.text for line in chunk.main_segments], target_language)
+        _raise_if_cancelled(self.cancel_token, "translate")
+        return result
 
 
 class LLMTranslationProvider(TranslationProvider):
@@ -428,7 +545,9 @@ class LLMTranslationProvider(TranslationProvider):
         target_language: str,
         content_type: str,
         custom_prompt: str,
+        cancel_token: CancellationToken | None = None,
     ) -> list[str]:
+        _raise_if_cancelled(cancel_token, "translate")
         texts = [line.text for line in chunk.main_segments]
         if not texts:
             return []
@@ -440,6 +559,7 @@ class LLMTranslationProvider(TranslationProvider):
         remaining_context_before = list(chunk.context_before)
 
         for attempt in range(MAX_PARTIAL_RETRIES + 1):
+            _raise_if_cancelled(cancel_token, "translate")
             if not remaining_segments:
                 break
 
@@ -450,7 +570,15 @@ class LLMTranslationProvider(TranslationProvider):
                 context_after=chunk.context_after,
                 use_sections=chunk.use_sections or len(remaining_context_before) > 0,
             )
-            content = self._request_translation(prompt, build_chunk_user_message(retry_chunk))
+            content = self._request_translation(
+                prompt,
+                build_chunk_user_message(retry_chunk),
+                cancel_token,
+                target_language=target_language,
+                chunk=retry_chunk,
+                attempt=attempt + 1,
+            )
+            _raise_if_cancelled(cancel_token, "translate")
             remaining_ids = [line.index for line in remaining_segments]
             remaining_texts = [line.text for line in remaining_segments]
 
@@ -485,6 +613,7 @@ class LLMTranslationProvider(TranslationProvider):
                         len(pr.matched), len(remaining_ids),
                         len(remaining_segments), attempt + 1,
                     )
+                    _raise_if_cancelled(cancel_token, "translate")
                     continue
                 else:
                     remaining_segments = []
@@ -495,6 +624,7 @@ class LLMTranslationProvider(TranslationProvider):
                 logger.warning(
                     "分块翻译完全失败，重试整块 (第 %d 次)", attempt + 1,
                 )
+                _raise_if_cancelled(cancel_token, "translate")
                 continue
             else:
                 raise PipelineError(
@@ -514,18 +644,85 @@ class LLMTranslationProvider(TranslationProvider):
     def _resolve_base_url(self) -> str:
         return self.client.resolved_base_url()
 
-    def _request_translation(self, prompt: str, user_content: str) -> str:
+    def _request_translation(
+        self,
+        prompt: str,
+        user_content: str,
+        cancel_token: CancellationToken | None = None,
+        *,
+        target_language: str = "",
+        chunk: TranslationChunk | None = None,
+        attempt: int = 1,
+    ) -> str:
+        _raise_if_cancelled(cancel_token, "translate")
+        started_at = time.perf_counter()
+
+        def error_details(exc_details: dict[str, Any] | None, error_code: str | None) -> dict[str, Any]:
+            context: dict[str, Any] = {
+                "provider": getattr(self.client, "provider_name", self.llm_type),
+                "model": self.model,
+                "target_language": target_language or None,
+                "attempt": attempt,
+                "elapsed_ms": round((time.perf_counter() - started_at) * 1000, 2),
+                "error_code": error_code,
+            }
+            if chunk is not None and chunk.main_segments:
+                context["chunk_start_index"] = chunk.main_segments[0].index
+                context["chunk_end_index"] = chunk.main_segments[-1].index
+            provider_elapsed = (exc_details or {}).get("elapsed_ms")
+            if provider_elapsed is not None:
+                context["provider_elapsed_ms"] = provider_elapsed
+            return sanitize_diagnostic_data({**(exc_details or {}), **context})
+
         try:
             return self.client.complete(
                 [
                     LLMMessage(role="system", content=prompt),
                     LLMMessage(role="user", content=user_content),
-                ]
+                ],
+                cancellation_check=lambda: _raise_if_cancelled(cancel_token, "translate"),
             )
+        except CancellationRequested:
+            raise
         except LLMRateLimitError as exc:
-            raise TranslationRateLimitError(str(exc)) from exc
+            details = error_details(exc.details, exc.error_code)
+            _log_exception_safely(
+                "LLM 翻译调用失败: "
+                + json.dumps(_diagnostic_log_payload(exc) | {"details": details}, ensure_ascii=False),
+                exc,
+            )
+            raise TranslationRateLimitError(str(exc), details) from exc
         except LLMError as exc:
-            raise PipelineError(str(exc)) from exc
+            details = error_details(exc.details, exc.error_code)
+            _log_exception_safely(
+                "LLM 翻译调用失败: "
+                + json.dumps(_diagnostic_log_payload(exc) | {"details": details}, ensure_ascii=False),
+                exc,
+            )
+            raise PipelineError(str(exc), details, error_code=exc.error_code) from exc
+        except Exception as exc:
+            safe_exception_message = str(sanitize_diagnostic_data(str(exc))).strip()
+            friendly_message = (
+                f"翻译服务调用失败: {safe_exception_message}"
+                if safe_exception_message
+                else "翻译服务调用失败"
+            )
+            details = error_details(
+                {
+                    "exception_type": type(exc).__name__,
+                    "exception_message": safe_exception_message or None,
+                },
+                LLM_UNKNOWN_ERROR,
+            )
+            _log_exception_safely(
+                "LLM 翻译调用失败: "
+                + json.dumps(
+                    {"error_code": LLM_UNKNOWN_ERROR, "message": friendly_message, "details": details},
+                    ensure_ascii=False,
+                ),
+                exc,
+            )
+            raise PipelineError(friendly_message, details, error_code=LLM_UNKNOWN_ERROR) from exc
 
     def _build_prompt(self, target_language: str, content_type: str = "general", custom_prompt: str = "") -> str:
         style_prompt = custom_prompt.strip() or TRANSLATION_PRESETS.get(content_type, TRANSLATION_PRESETS["general"])
@@ -666,17 +863,74 @@ def _read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _run_ffmpeg(command: list[str], timeout_message: str, failure_message: str) -> subprocess.CompletedProcess[str]:
+def _stop_ffmpeg(process: subprocess.Popen[str], stage: str, reason: str) -> tuple[str, str]:
+    logger.warning("FFmpeg [%s] %s，发送 terminate (pid=%s)", stage, reason, process.pid)
     try:
-        result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=7200)
-    except subprocess.TimeoutExpired as exc:
-        raise PipelineError(timeout_message) from exc
+        process.terminate()
+    except OSError:
+        logger.info("FFmpeg [%s] terminate 时进程已退出 (pid=%s)", stage, process.pid)
+    try:
+        return process.communicate(timeout=FFMPEG_TERMINATE_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            "FFmpeg [%s] terminate 后 %.1f 秒仍未退出，发送 kill (pid=%s)",
+            stage,
+            FFMPEG_TERMINATE_TIMEOUT_SECONDS,
+            process.pid,
+        )
+        try:
+            process.kill()
+        except OSError:
+            logger.info("FFmpeg [%s] kill 时进程已退出 (pid=%s)", stage, process.pid)
+        return process.communicate()
+
+
+def _run_ffmpeg(
+    command: list[str],
+    timeout_message: str,
+    failure_message: str,
+    *,
+    cancel_token: CancellationToken | None = None,
+    stage: str = "ffmpeg",
+) -> subprocess.CompletedProcess[str]:
+    _raise_if_cancelled(cancel_token, stage)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    logger.info("FFmpeg [%s] 已启动 (pid=%s)", stage, process.pid)
+    deadline = time.monotonic() + FFMPEG_TIMEOUT_SECONDS
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _stop_ffmpeg(process, stage, "执行超时")
+                raise PipelineError(timeout_message)
+            try:
+                stdout, stderr = process.communicate(timeout=min(remaining, FFMPEG_POLL_INTERVAL_SECONDS))
+                break
+            except subprocess.TimeoutExpired:
+                _raise_if_cancelled(cancel_token, stage)
+        _raise_if_cancelled(cancel_token, stage)
+    except CancellationRequested:
+        if process.poll() is None:
+            stdout, stderr = _stop_ffmpeg(process, stage, "收到取消请求")
+        logger.info("FFmpeg [%s] 已停止，阶段取消 (pid=%s)", stage, process.pid)
+        raise
+    except BaseException:
+        if process.poll() is None:
+            _stop_ffmpeg(process, stage, "调用异常")
+        raise
+    result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
     if result.returncode != 0:
         raise PipelineError(result.stderr.strip() or failure_message)
     return result
 
 
-def extract_audio(context: TaskContext) -> Path:
+def extract_audio(context: TaskContext, cancel_token: CancellationToken | None = None) -> Path:
+    _raise_if_cancelled(cancel_token, "extract_audio")
     whisper_config = context.config_snapshot["whisper"]
     source_path = Path(context.file_path)
     audio_format = str(whisper_config["audio_format"]).strip().lower()
@@ -697,7 +951,13 @@ def extract_audio(context: TaskContext) -> Path:
         str(whisper_config["sample_rate"]),
         str(audio_path),
     ]
-    _run_ffmpeg(command, "音频提取超时，FFmpeg 执行超过 7200 秒", "ffmpeg 执行失败")
+    _run_ffmpeg(
+        command,
+        "音频提取超时，FFmpeg 执行超过 7200 秒",
+        "ffmpeg 执行失败",
+        cancel_token=cancel_token,
+        stage="extract_audio",
+    )
     return audio_path
 
 
@@ -846,7 +1106,9 @@ def translate_segments(
     context: TaskContext,
     segments: list[dict[str, Any]],
     progress_callback=None,
+    cancel_token: CancellationToken | None = None,
 ) -> dict[str, list[str]]:
+    _raise_if_cancelled(cancel_token, "translate")
     translation_config = context.config_snapshot["translation"]
     if not translation_config["enabled"]:
         return {}
@@ -869,18 +1131,24 @@ def translate_segments(
             completed_chunks += 1
             progress_callback(completed_chunks, total_chunks)
 
-    translator = ChunkedTranslator(provider, content_type, custom_prompt, on_chunk_complete)
+    translator = ChunkedTranslator(provider, content_type, custom_prompt, on_chunk_complete, cancel_token)
     for language in target_languages:
+        _raise_if_cancelled(cancel_token, "translate")
         last_error: Exception | None = None
         for _ in range(max_retries):
+            _raise_if_cancelled(cancel_token, "translate")
             try:
                 translations[language] = translator.translate_language(segments, language)
                 last_error = None
+                _raise_if_cancelled(cancel_token, "translate")
                 break
+            except CancellationRequested:
+                raise
             except Exception as exc:
                 last_error = exc
+            _raise_if_cancelled(cancel_token, "translate")
         if last_error is not None:
-            raise PipelineError(str(last_error))
+            raise _pipeline_error_from(last_error)
     return translations
 
 
@@ -1068,7 +1336,12 @@ def _resolve_mux_output_path(context: TaskContext) -> Path:
     return output_path
 
 
-def mux_subtitle(context: TaskContext, subtitle_paths: list[str]) -> str:
+def mux_subtitle(
+    context: TaskContext,
+    subtitle_paths: list[str],
+    cancel_token: CancellationToken | None = None,
+) -> str:
+    _raise_if_cancelled(cancel_token, "mux")
     ffmpeg_path = shutil.which("ffmpeg")
     if not ffmpeg_path:
         raise PipelineError("ffmpeg 未安装，无法执行字幕封装")
@@ -1093,7 +1366,13 @@ def mux_subtitle(context: TaskContext, subtitle_paths: list[str]) -> str:
         )
     output_path = _resolve_mux_output_path(context)
     command.append(str(output_path))
-    _run_ffmpeg(command, "字幕封装超时，FFmpeg 执行超过 7200 秒", "ffmpeg 字幕封装失败")
+    _run_ffmpeg(
+        command,
+        "字幕封装超时，FFmpeg 执行超过 7200 秒",
+        "ffmpeg 字幕封装失败",
+        cancel_token=cancel_token,
+        stage="mux",
+    )
     return str(output_path)
 
 

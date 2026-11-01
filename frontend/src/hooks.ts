@@ -1,4 +1,4 @@
-import { DependencyList, useEffect } from 'react'
+import { DependencyList, useEffect, useRef } from 'react'
 
 export function usePolling(
   callback: () => void | Promise<void>,
@@ -6,12 +6,22 @@ export function usePolling(
   deps: DependencyList = [],
   enabled: boolean = true,
 ) {
+  const callbackRef = useRef(callback)
+
+  useEffect(() => {
+    callbackRef.current = callback
+  }, [callback])
+
   useEffect(() => {
     if (!enabled) return
-    void callback()
+    void callbackRef.current()
+  }, [enabled, ...deps])
+
+  useEffect(() => {
+    if (!enabled) return
     const timer = window.setInterval(() => {
-      void callback()
+      void callbackRef.current()
     }, intervalMs)
     return () => window.clearInterval(timer)
-  }, [callback, intervalMs, enabled, ...deps])
+  }, [intervalMs, enabled, ...deps])
 }

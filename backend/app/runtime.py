@@ -8,8 +8,10 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+from .llm import LLMError, sanitize_diagnostic_data
 from .pipeline import (
     CancellationRequested,
+    CancellationToken,
     PipelineError,
     TaskContext,
     align_segments,
@@ -38,10 +40,140 @@ from .pipeline import (
     WhisperModelCache,
 )
 from .store import Database
+from .worker_control import WorkerIdentity
 
 
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".wmv", ".m4v"}
 logger = logging.getLogger(__name__)
+
+_MAX_DIAGNOSTIC_DEPTH = 4
+_MAX_DIAGNOSTIC_ITEMS = 20
+_MAX_DIAGNOSTIC_STRING = 300
+_SENSITIVE_DIAGNOSTIC_KEYS = {
+    "api_key",
+    "apikey",
+    "authorization",
+    "body",
+    "content",
+    "exception_message",
+    "input",
+    "lines",
+    "message",
+    "messages",
+    "payload",
+    "prompt",
+    "raw",
+    "raw_body",
+    "refusal_preview",
+    "request_body",
+    "response_body",
+    "response_preview",
+    "segments",
+    "source_text",
+    "subtitle",
+    "subtitles",
+    "system_prompt",
+    "text",
+    "transcript",
+    "upstream_body_preview",
+}
+
+
+def _normalized_diagnostic_key(key: str) -> str:
+    return key.strip().lower().replace("-", "_").replace(" ", "_")
+
+
+def _is_sensitive_diagnostic_key(key: str) -> bool:
+    normalized = _normalized_diagnostic_key(key)
+    return (
+        normalized in _SENSITIVE_DIAGNOSTIC_KEYS
+        or normalized.endswith("_api_key")
+        or normalized.endswith("_authorization")
+        or normalized.endswith("_credential")
+        or normalized.endswith("_password")
+        or normalized.endswith("_preview")
+        or normalized.endswith("_secret")
+        or normalized.endswith("_token")
+    )
+
+
+def _limit_diagnostic_value(value: Any, depth: int = 0) -> Any:
+    if depth >= _MAX_DIAGNOSTIC_DEPTH:
+        return "[MAX_DEPTH]"
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, item in list(value.items())[:_MAX_DIAGNOSTIC_ITEMS]:
+            key_text = str(key)
+            if _is_sensitive_diagnostic_key(key_text):
+                continue
+            result[key_text] = _limit_diagnostic_value(item, depth + 1)
+        return result
+    if isinstance(value, list):
+        return [_limit_diagnostic_value(item, depth + 1) for item in value[:_MAX_DIAGNOSTIC_ITEMS]]
+    if isinstance(value, str):
+        return value if len(value) <= _MAX_DIAGNOSTIC_STRING else f"{value[:_MAX_DIAGNOSTIC_STRING]}..."
+    return value
+
+
+def _extract_failure_diagnostics(exc: BaseException) -> dict[str, Any]:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    diagnostic_source: BaseException | None = None
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        details = getattr(current, "details", None)
+        if isinstance(current, LLMError) or (isinstance(details, dict) and details):
+            diagnostic_source = current
+            break
+        current = current.__cause__ or current.__context__
+
+    if diagnostic_source is None:
+        return {}
+
+    sanitized = sanitize_diagnostic_data(getattr(diagnostic_source, "details", None) or {})
+    details = _limit_diagnostic_value(sanitized)
+    if not isinstance(details, dict):
+        details = {}
+    error_code = getattr(diagnostic_source, "error_code", None) or details.get("error_code")
+    if error_code:
+        details["error_code"] = str(error_code)
+    status_code = details.get("http_status", details.get("status_code"))
+    try:
+        if status_code is not None:
+            details["http_status"] = int(status_code)
+    except (TypeError, ValueError):
+        pass
+    return details
+
+
+def _safe_failure_message(exc: BaseException) -> str:
+    sanitized = sanitize_diagnostic_data(str(exc) or type(exc).__name__)
+    message = sanitized if isinstance(sanitized, str) else type(exc).__name__
+    return message[:_MAX_DIAGNOSTIC_STRING]
+
+
+def _diagnostic_summary(details: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("error_code", "http_status", "finish_reason", "provider", "model", "retry_mode"):
+        value = details.get(key)
+        if value is not None and value != "":
+            parts.append(f"{key}={value}")
+    return f" ({', '.join(parts)})" if parts else ""
+
+
+def _log_worker_failure(task_id: int, stage: str, task: dict[str, Any], details: dict[str, Any]) -> None:
+    summary = _diagnostic_summary(details)
+    if task.get("status") == "pending":
+        logger.warning(
+            "任务 %s 在阶段 %s 失败，将自动重试 (%s/%s)%s",
+            task_id,
+            stage,
+            task.get("retry_count"),
+            task.get("max_retries"),
+            summary,
+        )
+    else:
+        logger.error("任务 %s 在阶段 %s 最终失败%s", task_id, stage, summary)
 
 
 def _mux_output_suffix(config: dict) -> str:
@@ -179,9 +311,20 @@ class ScannerService:
 
 
 class WorkerService:
-    def __init__(self, database: Database):
+    def __init__(self, database: Database, worker_identity: WorkerIdentity | None = None):
         self.database = database
+        self.worker_identity = worker_identity
         self.model_cache = WhisperModelCache()
+
+    def _set_worker_task(self, task_id: int | None, stage: str | None) -> None:
+        if self.worker_identity is None:
+            return
+        self.database.update_worker_task(
+            self.worker_identity.pid,
+            self.worker_identity.process_start_id,
+            task_id,
+            stage,
+        )
 
     def run_forever(self) -> None:
         while True:
@@ -198,6 +341,7 @@ class WorkerService:
         task = self.database.claim_next_pending_task()
         if not task:
             return False
+        self._set_worker_task(int(task["id"]), str(task["stage"]))
         try:
             result_payload = self._process_claimed_task(task)
             self.database.mark_task_done(task["id"], result_payload)
@@ -206,7 +350,13 @@ class WorkerService:
             self.database.mark_task_cancelled(task["id"], latest["stage"] if latest else task["stage"])
         except Exception as exc:
             latest = self.database.get_task(task["id"])
-            self.database.mark_task_failure(task["id"], latest["stage"] if latest else task["stage"], str(exc))
+            failure_stage = latest["stage"] if latest else task["stage"]
+            diagnostics = _extract_failure_diagnostics(exc)
+            safe_message = _safe_failure_message(exc)
+            updated = self.database.mark_task_failure(task["id"], failure_stage, safe_message, diagnostics)
+            _log_worker_failure(task["id"], failure_stage, updated, diagnostics)
+        finally:
+            self._set_worker_task(None, None)
         return True
 
     def _process_claimed_task(self, task: dict[str, Any]) -> dict[str, Any]:
@@ -221,6 +371,8 @@ class WorkerService:
             config_snapshot=snapshot,
             work_dir=work_dir,
         )
+        task_id = int(task["id"])
+        cancel_token = CancellationToken(lambda: self.database.is_cancel_requested(task_id))
         intermediates_dir = ensure_intermediates_dir(context)
         if context.using_fallback_intermediates:
             self.database.log(
@@ -255,7 +407,13 @@ class WorkerService:
         if start_stage == "mux":
             result_payload = read_stage_artifacts(context)
         if start_stage in {"queued", "extract_audio"}:
-            audio_path = self._run_stage(task["id"], "extract_audio", 10, lambda: extract_audio(context))
+            audio_path = self._run_stage(
+                task_id,
+                "extract_audio",
+                10,
+                lambda: extract_audio(context, cancel_token),
+                cancel_token,
+            )
         if start_stage in {"queued", "extract_audio", "run_asr"}:
             if audio_path is None:
                 raise PipelineError("缺少音频文件，无法执行 ASR")
@@ -285,7 +443,7 @@ class WorkerService:
             if processed_segments is None:
                 raise PipelineError("缺少分段结果，无法继续执行")
             translations = self._run_stage(
-                task["id"],
+                task_id,
                 "translate",
                 60,
                 lambda: translate_segments(
@@ -296,7 +454,9 @@ class WorkerService:
                         "translate",
                         60 + int(20 * current / total),
                     ),
+                    cancel_token=cancel_token,
                 ),
+                cancel_token,
             )
             save_translations(context, translations)
         if start_stage in {"queued", "extract_audio", "run_asr", "align_segments", "text_process", "translate", "subtitle_render"}:
@@ -316,7 +476,13 @@ class WorkerService:
         if result_payload is None:
             raise PipelineError("缺少任务结果元数据")
         if snapshot["mux"]["enabled"]:
-            mux_path = self._run_stage(task["id"], "mux", 100, lambda: mux_subtitle(context, subtitle_paths))
+            mux_path = self._run_stage(
+                task_id,
+                "mux",
+                100,
+                lambda: mux_subtitle(context, subtitle_paths, cancel_token),
+                cancel_token,
+            )
             result_payload["mux_path"] = mux_path
             write_stage_artifacts(context, result_payload)
         if not snapshot["processing"]["keep_intermediates"]:
@@ -325,15 +491,34 @@ class WorkerService:
                 cleanup_work_dir_intermediates(context.work_dir)
         return result_payload
 
-    def _run_stage(self, task_id: int, stage: str, progress: float, action):
-        self._ensure_not_cancelled(task_id, stage)
+    def _run_stage(
+        self,
+        task_id: int,
+        stage: str,
+        progress: float,
+        action,
+        cancel_token: CancellationToken | None = None,
+    ):
+        self._ensure_not_cancelled(task_id, stage, cancel_token)
         self.database.update_task_stage(task_id, stage, progress)
+        self._set_worker_task(task_id, stage)
         self.database.log(task_id, stage, "INFO", f"开始阶段 {stage}")
-        result = action()
+        try:
+            result = action()
+            self._ensure_not_cancelled(task_id, stage, cancel_token)
+        except CancellationRequested:
+            self.database.log(task_id, stage, "WARNING", f"阶段 {stage} 收到取消请求并停止")
+            raise
         self.database.log(task_id, stage, "INFO", f"完成阶段 {stage}")
-        self._ensure_not_cancelled(task_id, stage)
         return result
 
-    def _ensure_not_cancelled(self, task_id: int, stage: str) -> None:
-        if self.database.is_cancel_requested(task_id):
+    def _ensure_not_cancelled(
+        self,
+        task_id: int,
+        stage: str,
+        cancel_token: CancellationToken | None = None,
+    ) -> None:
+        if cancel_token is not None:
+            cancel_token.raise_if_cancelled(stage)
+        elif self.database.is_cancel_requested(task_id):
             raise CancellationRequested(stage)
