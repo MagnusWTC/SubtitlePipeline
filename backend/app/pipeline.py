@@ -22,6 +22,7 @@ CONTEXT_SIZE = 5
 MAX_CHUNK_WORKERS = 1
 MAX_CHUNK_RETRIES = 5
 MAX_PARTIAL_RETRIES = 3
+MIN_SUBTITLE_DURATION_SECONDS = 0.8
 FFMPEG_TIMEOUT_SECONDS = 7200
 FFMPEG_POLL_INTERVAL_SECONDS = 0.25
 FFMPEG_TERMINATE_TIMEOUT_SECONDS = 5.0
@@ -319,66 +320,32 @@ def parse_numbered_lines_ordered(
     raw_output: str,
     expected_ids: list[int],
 ) -> ParseResult:
-    """Parse ``编号|译文`` lines and identify the first failure point.
-
-    Lines are scanned in document order.  The parser collects every valid
-    match whose index belongs to ``expected_ids``.  After collecting, we
-    walk ``expected_ids`` sequentially; the first id that is missing marks
-    the failure boundary – every id *before* it is considered valid, every
-    id from that point on is considered failed (even if some later ids
-    happened to match) so that the caller can retry a contiguous suffix.
-    """
-    matches: dict[int, str] = {}
-    expected = set(expected_ids)
+    """Accept only a unique, nonempty, correctly ordered numbered prefix."""
+    parsed: list[tuple[int, str] | None] = []
     for line in strip_code_fence(raw_output).splitlines():
-        normalized = line.strip()
-        if not normalized:
+        line = line.strip()
+        if not line:
             continue
-        # Try to match "编号|译文" or "编号｜译文" format (half-width or full-width pipe)
-        if "|" in normalized or "｜" in normalized:
-            # Replace full-width pipe with half-width for uniform processing
-            normalized_pipe = normalized.replace("｜", "|")
-            prefix, value = normalized_pipe.split("|", 1)
-            if prefix.strip().isdigit():
-                index = int(prefix.strip())
-                if index in expected and index not in matches:
-                    cleaned_value = value.strip().lstrip("|｜").strip()
-                    matches[index] = cleaned_value
-                continue
-        # Also accept "编号. 译文" or "编号: 译文" as fallback
-        m = re.match(r"^\s*(\d+)\s*[.:：]\s*(.+)$", normalized)
-        if m:
-            index = int(m.group(1))
-            if index in expected and index not in matches:
-                matches[index] = m.group(2).strip()
-            continue
-        # Last resort: bare number prefix "编号译文" (no delimiter)
-        m = re.match(r"^\s*(\d+)(\S.*)$", normalized)
-        if m:
-            index = int(m.group(1))
-            if index in expected and index not in matches:
-                matches[index] = m.group(2).strip()
-            continue
-        # Last resort: bare number prefix "编号译文" (LLM forgot the separator)
-        m = re.match(r"^\s*(\d+)(\S.*)$", normalized)
-        if m:
-            index = int(m.group(1))
-            if index in expected and index not in matches:
-                matches[index] = m.group(2).strip()
+        match = re.match(r"^(\d+)\s*[|｜.:：]+\s*(.*)$", line)
+        if not match:
+            match = re.match(r"^(\d+)(\D.*)$", line)
+        parsed.append((int(match.group(1)), match.group(2).strip()) if match else None)
 
-    # Walk expected_ids to find the first gap
-    first_failed: int | None = None
-    for position, eid in enumerate(expected_ids):
-        if eid not in matches:
-            first_failed = position
-            break
-
-    if first_failed is not None:
-        # Only keep the contiguous prefix (discard any sporadic matches after the gap)
-        valid_ids = set(expected_ids[:first_failed])
-        matches = {k: v for k, v in matches.items() if k in valid_ids}
-
-    return ParseResult(matched=matches, first_failed_position=first_failed)
+    counts: dict[int, int] = {}
+    for item in parsed:
+        if item is not None:
+            counts[item[0]] = counts.get(item[0], 0) + 1
+    matches: dict[int, str] = {}
+    for position, expected_id in enumerate(expected_ids):
+        if position >= len(parsed):
+            return ParseResult(matches, position)
+        item = parsed[position]
+        if item is None or item[0] != expected_id or not item[1] or counts[item[0]] != 1:
+            return ParseResult(matches, position)
+        matches[expected_id] = item[1]
+    if len(parsed) != len(expected_ids):
+        return ParseResult({}, 0)
+    return ParseResult(matches, None)
 
 
 def parse_numbered_lines(
@@ -389,12 +356,6 @@ def parse_numbered_lines(
     result = parse_numbered_lines_ordered(raw_output, expected_ids)
     if result.first_failed_position is None:
         return [result.matched[eid] for eid in expected_ids]
-    if source_texts is not None and expected_ids:
-        matched_ratio = len(result.matched) / len(expected_ids)
-        if matched_ratio >= 0.8:
-            missing = [eid for eid in expected_ids if eid not in result.matched]
-            logger.warning("分块翻译部分匹配，缺失编号将回退原文: %s", missing)
-            return [result.matched.get(eid, source_texts[pos]) for pos, eid in enumerate(expected_ids)]
     return None
 
 
@@ -405,27 +366,9 @@ def parse_chunk_output(
     json_array_parser=None,
 ) -> list[str]:
     numbered = parse_numbered_lines(raw_output, expected_ids, source_texts)
-    if numbered is not None:
-        return numbered
-    if json_array_parser is not None:
-        try:
-            parsed = json_array_parser(raw_output)
-        except PipelineError:
-            parsed = None
-        if isinstance(parsed, list) and len(parsed) == len(expected_ids):
-            return [str(item).strip() for item in parsed]
-    lines = [strip_number_prefix(line) for line in strip_code_fence(raw_output).splitlines() if line.strip()]
-    if len(lines) == len(expected_ids):
-        return lines
-    # Last resort: if lines are close (within 20%), pad or truncate
-    if lines and abs(len(lines) - len(expected_ids)) <= max(1, len(expected_ids) // 5):
-        logger.warning("翻译结果行数 %d != 期望 %d，尝试对齐", len(lines), len(expected_ids))
-        if len(lines) > len(expected_ids):
-            return lines[:len(expected_ids)]
-        return lines + [source_texts[i] for i in range(len(lines), len(expected_ids))]
-    raise PipelineError(
-        f"翻译返回结果无法解析 (得到 {len(lines)} 行, 期望 {len(expected_ids)} 行)"
-    )
+    if numbered is None:
+        raise PipelineError("翻译结果编号缺失、重复、错序或译文为空")
+    return numbered
 
 
 class ChunkedTranslator:
@@ -627,9 +570,7 @@ class LLMTranslationProvider(TranslationProvider):
                 _raise_if_cancelled(cancel_token, "translate")
                 continue
             else:
-                raise PipelineError(
-                    f"分块翻译经过 {MAX_PARTIAL_RETRIES + 1} 次尝试仍无法解析"
-                )
+                logger.warning("分块翻译经过 %d 次尝试仍无法解析，剩余条目回退原文", MAX_PARTIAL_RETRIES + 1)
 
         # Fill any remaining None with source text as last resort
         final: list[str] = []
@@ -726,6 +667,14 @@ class LLMTranslationProvider(TranslationProvider):
 
     def _build_prompt(self, target_language: str, content_type: str = "general", custom_prompt: str = "") -> str:
         style_prompt = custom_prompt.strip() or TRANSLATION_PRESETS.get(content_type, TRANSLATION_PRESETS["general"])
+        if not custom_prompt.strip():
+            style_prompt += " Preserve meaningful interjections, exclamations, and vocalizations; do not omit short utterances."
+            if target_language.strip().lower().replace("_", "-") in {"zh", "zh-cn", "zh-hans"}:
+                style_prompt += (
+                    " Translate into natural, concise Simplified Chinese. Translate each subtitle independently; "
+                    "do not merge subtitles or move translations between lines. Preserve the speaker's tone "
+                    "and intensity, and do not add information absent from the source."
+                )
         return f"{style_prompt}\n\n{FORMAT_INSTRUCTION.format(target_language=target_language)}"
 
     def _parse_json_array_content(self, content: str) -> list[Any]:
@@ -1056,7 +1005,7 @@ def align_segments(
 
 
 def process_text_segments(segments: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    # Step 1: Clean segments (remove repetition loops, merge fragments, split long segments, etc.)
+    # Preserve dialogue while compressing repeated vocalizations and using aligned word times.
     cleaned = clean_segments(segments)
 
     # Step 2: Normalize whitespace and add trailing punctuation
@@ -1258,6 +1207,15 @@ def render_srt(
 def build_srt_content(segments: list[dict[str, Any]], translated_lines: list[str] | None, replace_source: bool = False) -> str:
     blocks: list[str] = []
     for index, segment in enumerate(segments, start=1):
+        start = float(segment['start'])
+        end = float(segment['end'])
+        if end - start < MIN_SUBTITLE_DURATION_SECONDS:
+            next_start = float(segments[index]['start']) if index < len(segments) else None
+            desired_end = start + MIN_SUBTITLE_DURATION_SECONDS
+            if next_start is None:
+                end = max(end, desired_end)
+            elif next_start > end:
+                end = max(end, min(desired_end, next_start))
         if replace_source and translated_lines:
             lines = [translated_lines[index - 1]]
         else:
@@ -1268,7 +1226,7 @@ def build_srt_content(segments: list[dict[str, Any]], translated_lines: list[str
             "\n".join(
                 [
                     str(index),
-                    f"{format_srt_time(float(segment['start']))} --> {format_srt_time(float(segment['end']))}",
+                    f"{format_srt_time(start)} --> {format_srt_time(end)}",
                     *lines,
                 ]
             )

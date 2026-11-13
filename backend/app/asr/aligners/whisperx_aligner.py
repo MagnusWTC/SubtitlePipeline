@@ -29,4 +29,9 @@ class WhisperXAligner:
         align_language = str(language or "en").strip() or "en"
         align_model, metadata = self.model_cache.get_align_model(align_language, device)
         aligned = whisperx.align(segments, align_model, metadata, str(audio_path), device)
-        return normalize_asr_segments(aligned.get("segments", []))
+        aligned_segments = aligned.get("segments", [])
+        normalized = normalize_asr_segments(aligned_segments)
+        for segment, source in zip(normalized, aligned_segments):
+            if isinstance(source.get("words"), list):
+                segment["words"] = source["words"]
+        return normalized

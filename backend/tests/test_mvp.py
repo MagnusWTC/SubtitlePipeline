@@ -757,10 +757,7 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
             parse_numbered_lines("0|你好\n1|世界", [0, 1]),
             ["你好", "世界"],
         )
-        self.assertEqual(
-            parse_numbered_lines("0|你好\n1|世界\n2|忽略\n3|也忽略\n5|再忽略", [0, 1, 2, 3, 4], ["a", "b", "c", "d", "e"]),
-            ["你好", "世界", "忽略", "也忽略", "e"],
-        )
+        self.assertIsNone(parse_numbered_lines("0|你好\n1|世界\n2|忽略\n3|也忽略\n5|再忽略", [0, 1, 2, 3, 4], ["a", "b", "c", "d", "e"]))
         self.assertIsNone(parse_numbered_lines("0|你好", [0, 1, 2], ["a", "b", "c"]))
 
     def test_parse_chunk_output_fallbacks(self) -> None:
@@ -768,14 +765,10 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
             parse_chunk_output("0|你好\n1|世界", [0, 1], ["hello", "world"]),
             ["你好", "世界"],
         )
-        self.assertEqual(
-            parse_chunk_output('["你好", "世界"]', [0, 1], ["hello", "world"], lambda content: json.loads(content)),
-            ["你好", "世界"],
-        )
-        self.assertEqual(
-            parse_chunk_output("你好\n世界", [0, 1], ["hello", "world"]),
-            ["你好", "世界"],
-        )
+        with self.assertRaises(PipelineError):
+            parse_chunk_output('["你好", "世界"]', [0, 1], ["hello", "world"], lambda content: json.loads(content))
+        with self.assertRaises(PipelineError):
+            parse_chunk_output("你好\n世界", [0, 1], ["hello", "world"])
 
     def test_ffmpeg_timeout_raises_pipeline_error(self) -> None:
         snapshot = self.database.get_config()
@@ -1140,8 +1133,14 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
 
         self.assertIn(TRANSLATION_PRESETS["movie"], movie_prompt)
         self.assertIn(FORMAT_INSTRUCTION.format(target_language="zh-CN"), movie_prompt)
+        self.assertIn("Simplified Chinese", movie_prompt)
+        self.assertIn("do not merge subtitles", movie_prompt)
+        self.assertIn("do not add information absent from the source", movie_prompt)
+        self.assertIn("Simplified Chinese", provider._build_prompt("zh", "general", ""))
+        self.assertNotIn("Simplified Chinese", provider._build_prompt("en", "general", ""))
         self.assertIn("custom style", custom_prompt)
         self.assertNotIn(TRANSLATION_PRESETS["movie"], custom_prompt)
+        self.assertNotIn("Simplified Chinese", custom_prompt)
 
     @patch("app.llm.providers.OpenAI")
     def test_translate_segments_chunked_flow(self, mock_openai: MagicMock) -> None:
@@ -1198,7 +1197,7 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
     @patch("app.llm.providers.OpenAI")
     def test_openai_compatible_translation_provider(self, mock_openai: MagicMock) -> None:
         mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = self._stream_chunks('["你好", "世界"]')
+        mock_client.chat.completions.create.return_value = self._stream_chunks('0|你好\n1|世界')
         mock_openai.return_value = mock_client
 
         snapshot = self.database.get_config()
@@ -1227,9 +1226,9 @@ class SubtitlePipelineMvpTests(unittest.TestCase):
         self.assertEqual(mock_client.chat.completions.create.call_args.kwargs["model"], "gpt-4o-mini")
 
     @patch("app.llm.providers.OpenAI")
-    def test_translation_debug_and_fenced_json_response(self, mock_openai: MagicMock) -> None:
+    def test_translation_debug_and_fenced_numbered_response(self, mock_openai: MagicMock) -> None:
         mock_client = MagicMock()
-        mock_client.chat.completions.create.return_value = self._stream_chunks('```json\n["你好，世界。", "第二行。"]\n```')
+        mock_client.chat.completions.create.return_value = self._stream_chunks('```text\n0|你好，世界。\n1|第二行。\n```')
         mock_openai.return_value = mock_client
 
         result = debug_translation_request(
