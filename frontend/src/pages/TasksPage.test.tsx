@@ -152,6 +152,58 @@ describe('TasksPage cancellation', () => {
     expect(screen.queryByRole('button', { name: '取消中' })).not.toBeInTheDocument()
   })
 
+  it('renders every task status and includes completed and cancelled tasks in the total', async () => {
+    apiMocks.getTasks.mockResolvedValue(
+      makeTaskList([
+        makeTask({ id: 1, file_path: 'pending.mp4', status: 'pending', stage: 'queued', progress: 0 }),
+        makeTask({ id: 2, file_path: 'processing.mp4', status: 'processing' }),
+        makeTask({ id: 3, file_path: 'failed.mp4', status: 'failed', stage: 'translate', progress: 60 }),
+        makeTask({ id: 4, file_path: 'done.mp4', status: 'done', stage: 'output_finalize', progress: 100 }),
+        makeTask({ id: 5, file_path: 'cancelled.mp4', status: 'cancelled', stage: 'translate', progress: 60 }),
+      ]),
+    )
+
+    renderTasksPage()
+
+    expect(await screen.findByText('pending.mp4')).toBeInTheDocument()
+    expect(screen.getByText('processing.mp4')).toBeInTheDocument()
+    expect(screen.getByText('failed.mp4')).toBeInTheDocument()
+    expect(screen.getByText('done.mp4')).toBeInTheDocument()
+    expect(screen.getByText('cancelled.mp4')).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '全部 5' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '已完成 1' })).toBeInTheDocument()
+  })
+
+  it('resets pagination when filtering completed tasks and allows restarting them', async () => {
+    const user = userEvent.setup()
+    const completedTask = makeTask({ file_path: 'done.mp4', status: 'done', progress: 100 })
+    apiMocks.getTasks.mockImplementation(async (status, page) => ({
+      ...makeTaskList(status === 'done' ? [completedTask] : [makeTask()]),
+      page,
+      total: status === 'done' ? 1 : 21,
+      status_counts: { processing: 20, done: 1 },
+    }))
+    apiMocks.retryTask.mockResolvedValue(undefined)
+
+    renderTasksPage()
+
+    await screen.findByText('task.mp4')
+    await user.click(screen.getByRole('button', { name: '下一页' }))
+    await waitFor(() => expect(apiMocks.getTasks).toHaveBeenLastCalledWith(undefined, 2, 20))
+    await user.click(screen.getByRole('button', { name: '已完成 1' }))
+
+    expect(await screen.findByText('done.mp4')).toBeInTheDocument()
+    expect(apiMocks.getTasks).toHaveBeenLastCalledWith('done', 1, 20)
+    expect(screen.getByRole('button', { name: '上一页' })).toBeDisabled()
+    expect(screen.getByRole('button', { name: '下一页' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '重新执行' }))
+    expect(apiMocks.retryTask).toHaveBeenCalledWith(1, 'restart')
+
+    await user.click(screen.getByRole('button', { name: '全部 21' }))
+    expect(await screen.findByText('task.mp4')).toBeInTheDocument()
+    expect(apiMocks.getTasks).toHaveBeenLastCalledWith(undefined, 1, 20)
+  })
+
   it('uses a one-second polling interval while cancellation is pending', async () => {
     vi.useFakeTimers()
     try {

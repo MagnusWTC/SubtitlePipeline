@@ -181,6 +181,49 @@ class TaskCancellationTests(unittest.TestCase):
         self.assertEqual(stored["status"], "cancelled")
         self.assertIsNone(stored["result_payload"])
 
+    def test_default_task_list_includes_all_statuses_and_supports_filtering_and_pagination(self) -> None:
+        tasks = [self._create_task() for _ in range(5)]
+        statuses = ["pending", "processing", "failed", "done", "cancelled"]
+        with self.database.connect() as connection:
+            for task, status in zip(tasks, statuses):
+                connection.execute(
+                    "UPDATE tasks SET status = ?, finished_at = ? WHERE id = ?",
+                    (status, "test" if status in {"failed", "done", "cancelled"} else None, task["id"]),
+                )
+
+        page = self.database.list_tasks(page=1, page_size=20)
+        self.assertEqual({item["status"] for item in page.items}, set(statuses))
+        self.assertEqual(page.total, 5)
+        self.assertEqual(
+            {item["status"] for item in self.database.list_tasks(page=1, page_size=20, status="done").items},
+            {"done"},
+        )
+
+        with TestClient(create_app()) as client:
+            response = client.get("/api/tasks")
+            completed_response = client.get("/api/tasks", params={"status": "done"})
+            pages = [
+                client.get("/api/tasks", params={"page": number, "page_size": 2}).json()
+                for number in range(1, 4)
+            ]
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total"], 5)
+        self.assertEqual(
+            {item["status"] for item in response.json()["items"]},
+            set(statuses),
+        )
+        self.assertEqual(response.json()["status_counts"], dict.fromkeys(statuses, 1))
+        self.assertEqual(completed_response.status_code, 200)
+        self.assertEqual(completed_response.json()["total"], 1)
+        self.assertEqual(completed_response.json()["items"][0]["status"], "done")
+        self.assertEqual([page["total"] for page in pages], [5, 5, 5])
+        self.assertEqual([len(page["items"]) for page in pages], [2, 2, 1])
+        self.assertEqual(
+            [item["id"] for page in pages for item in page["items"]],
+            [item["id"] for item in response.json()["items"]],
+        )
+
     def test_failure_after_cancel_does_not_requeue_or_retry(self) -> None:
         task = self._claim_processing_task()
 
